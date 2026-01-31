@@ -24,6 +24,7 @@ enum Entrypoint {
         } catch {
             app.logger.report(error: error)
             // http client is not shut down before deinit
+            
             try? await app.asyncShutdown()
             throw error
         }

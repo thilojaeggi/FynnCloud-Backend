@@ -28,6 +28,32 @@ struct AuthController: RouteCollection {
 
     // MARK: - Login (Web Interface)
 
+    func loginEasy(req: Request) async throws -> LoginResponse {
+        struct EasyLoginDTO: Content {
+            var username: String
+        }
+        let loginData = try req.content.decode(EasyLoginDTO.self)
+
+        guard
+            let user = try await User.query(on: req.db)
+                .filter(\.$username == loginData.username)
+                .first()
+        else {
+            throw Abort(.unauthorized, reason: "Invalid credentials")
+        }
+
+        let grant = OAuthGrant(
+            userID: try user.requireID(),
+            clientID: "fynncloud-web",
+            userAgent: req.headers["User-Agent"].first ?? "",
+        )
+        try await grant.save(on: req.db)
+
+        let loginResponse = try await generateTokens(for: grant, req: req, user: user)
+
+        return loginResponse
+    }
+
     func login(req: Request) async throws -> AuthorizeResponse {
         let loginData = try req.content.decode(LoginWithOAuthDTO.self)
 

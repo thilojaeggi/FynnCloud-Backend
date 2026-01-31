@@ -8,11 +8,11 @@ A high-performance, self-hosted cloud storage solution powered by **Swift** and 
 
 ---
 
-[!WARNING] ⚠️ Development Status: Early Alpha
-This project is in an **early development stage**. 
-* **Database Schema:** Subject to change without migrations.
-* **API:** Breaking changes may occur on any commit.
-* **Stability:** Not recommended for production data yet.
+> [!WARNING] ⚠️ Development Status: Early Alpha
+> This project is in an **early development stage**. 
+> * **Database Schema:** Subject to change without migrations.
+> * **API:** Breaking changes may occur on any commit.
+> * **Stability:** Not recommended for production data yet.
 
 ---
 
