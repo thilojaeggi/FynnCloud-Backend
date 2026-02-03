@@ -40,8 +40,8 @@ public func configure(_ app: Application) async throws {
         app.logger.info("Using S3 storage with bucket: \(bucket)")
         let awsClient = AWSClient(
             credentialProvider: .static(
-                accessKeyId: config.awsAccessKey,
-                secretAccessKey: config.awsSecretKey
+                accessKeyId: config.aws.accessKey,
+                secretAccessKey: config.aws.secretKey
             ),
             retryPolicy: .default,
             options: .init(),

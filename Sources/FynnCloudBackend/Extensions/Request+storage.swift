@@ -20,8 +20,8 @@ extension Request {
             provider = S3StorageProvider(
                 s3: S3(
                     client: application.aws,
-                    region: .init(awsRegionName: application.config.awsRegion),
-                    endpoint: application.config.awsEndpoint,
+                    region: .init(awsRegionName: application.config.aws.region),
+                    endpoint: application.config.aws.endpoint,
 
                 ),
                 bucket: bucket,

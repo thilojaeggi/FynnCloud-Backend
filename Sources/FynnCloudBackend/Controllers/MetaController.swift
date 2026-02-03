@@ -17,44 +17,11 @@ struct MetaController: RouteCollection {
 
     func info(req: Request) async throws -> ServerInfo {
         return ServerInfo(
-            appName: Environment.process.APP_NAME ?? "FynnCloud",
-            version: "1.0.0",
+            appName: req.application.config.appName,
+            version: req.application.config.appVersion,
             maxFileSize: Int64(req.application.routes.defaultMaxBodySize.value),
             environment: req.application.environment.name,
-            primaryColor: Self.getColor(),
+            primaryColor: req.application.config.primaryColor.rawValue
         )
-    }
-
-    private static func getColor() -> String {
-        let allowedColors = [
-            "slate",
-            "gray",
-            "zinc",
-            "neutral",
-            "stone",
-            "red",
-            "orange",
-            "amber",
-            "yellow",
-            "lime",
-            "green",
-            "emerald",
-            "teal",
-            "cyan",
-            "sky",
-            "blue",
-            "indigo",
-            "violet",
-            "purple",
-            "fuchsia",
-            "pink",
-            "rose",
-        ]
-
-        if let envColor = Environment.process.PRIMARY_COLOR, allowedColors.contains(envColor) {
-            return envColor
-        }
-
-        return "blue"
     }
 }
