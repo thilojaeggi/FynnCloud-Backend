@@ -14,18 +14,11 @@ extension Application {
         typealias Value = StorageConfiguration
     }
 
-    var storageConfig: StorageConfiguration {
-        get {
-            self.storage[StorageConfigKey.self]
-                ?? .init(
-                    driver: .local(
-                        path: Environment.get("STORAGE_PATH") ?? self.directory.workingDirectory
-                            + "Storage/"))
-        }
+    var storageConfig: StorageConfiguration? {
+        get { self.storage[StorageConfigKey.self] }
         set { self.storage[StorageConfigKey.self] = newValue }
     }
 
-    // Manage a single Soto AWSClient instance for the whole app
     private struct AWSClientKey: StorageKey {
         typealias Value = AWSClient
     }
