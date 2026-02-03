@@ -58,7 +58,7 @@ struct StorageService: Sendable {
 
         // If we exhausted retries, throw the last error encountered
         logger.error("Failed to record sync change after \(maxRetries) attempts.")
-        throw lastError ?? Abort(.internalServerError)
+        throw lastError ?? Abort(.internalServerError).localized("error.generic")
     }
 
     // MARK: - Retrieval Logic
@@ -126,7 +126,8 @@ struct StorageService: Sendable {
     func getFileResponse(for id: UUID, userID: UUID) async throws -> Response {
         let metadata = try await validateOwnership(fileID: id, userID: userID)
         guard !metadata.isDirectory else {
-            throw Abort(.badRequest, reason: "Cannot download a directory.")
+            throw Abort(.badRequest, reason: "Cannot download a directory.").localized(
+                "error.generic")
         }
         return try await provider.getResponse(for: id, on: eventLoop)
     }
@@ -136,7 +137,7 @@ struct StorageService: Sendable {
     func upload(
         filename: String,
         stream: Request.Body,
-        size: Int64,
+        claimedSize: Int64,  // Renamed from 'size'
         contentType: String,
         parentID: UUID?,
         userID: UUID,
@@ -145,25 +146,62 @@ struct StorageService: Sendable {
         let fileID = UUID()
         try await ensureUniqueName(name: filename, parentID: parentID, userID: userID)
 
-        // Validate and Reserve Quota
-        try await reserveQuota(amount: size, userID: userID)
+        // SECURITY: Add a reasonable buffer (e.g., 5%) or fixed amount for overhead
+        // This prevents immediate failure due to encoding differences
+        let maxAllowedSize = claimedSize + max(claimedSize / 20, 1024 * 1024)  // 5% or 1MB buffer
 
-        // Physical Write
+        // Validate and Reserve Quota based on claimed size
+        try await reserveQuota(amount: claimedSize, userID: userID)
+
+        // Physical Write with size enforcement
+        let actualSize: Int64
         do {
-            try await provider.save(stream: stream, id: fileID, size: size, on: eventLoop)
+            actualSize = try await provider.save(
+                stream: stream,
+                id: fileID,
+                maxSize: maxAllowedSize,  // Enforce maximum
+                on: eventLoop
+            )
         } catch {
             // FAILURE RECOVERY: If the disk write fails, decrement quota
-            logger.error("Upload failed for user \(userID). Reclaiming \(size) bytes.")
-            try? await decrementQuota(amount: size, userID: userID)
+            logger.error("Upload failed for user \(userID). Reclaiming \(claimedSize) bytes.")
+            try? await decrementQuota(amount: claimedSize, userID: userID)
             throw error
         }
 
-        // COMMIT: Save Metadata
+        // SECURITY CHECK: Verify actual size is within acceptable range
+        let tolerance: Int64 = 1024 * 1024  // 1MB tolerance for encoding overhead
+        if actualSize > claimedSize + tolerance {
+            logger.error(
+                "Size mismatch: claimed \(claimedSize) bytes, actual \(actualSize) bytes"
+            )
+            // Clean up the file
+            try? await provider.delete(id: fileID)
+            try? await decrementQuota(amount: claimedSize, userID: userID)
+            throw Abort(
+                .badRequest,
+                reason: """
+                    Upload size mismatch. Claimed \(claimedSize) bytes, \
+                    but received \(actualSize) bytes.
+                    """
+            )
+        }
+
+        // If actual size is significantly less, adjust quota
+        let sizeDelta = claimedSize - actualSize
+        if sizeDelta > tolerance {
+            try? await decrementQuota(amount: sizeDelta, userID: userID)
+            logger.info(
+                "Reclaimed \(sizeDelta) bytes of unused quota for user \(userID)"
+            )
+        }
+
+        // COMMIT: Save Metadata with ACTUAL size
         let metadata = FileMetadata(
             id: fileID,
             filename: filename,
             contentType: contentType,
-            size: size,
+            size: actualSize,  // Use actual, not claimed
             parentID: parentID,
             ownerID: userID,
             lastModified: lastModified != nil
@@ -179,7 +217,7 @@ struct StorageService: Sendable {
             // If metadata fails to save, we have a "Ghost File" on disk.
             // Clean up disk and quota.
             try? await provider.delete(id: fileID)
-            try? await decrementQuota(amount: size, userID: userID)
+            try? await decrementQuota(amount: actualSize, userID: userID)
             throw error
         }
     }
@@ -187,7 +225,7 @@ struct StorageService: Sendable {
     func update(
         fileID: UUID,
         stream: Request.Body,
-        newSize: Int64,
+        claimedSize: Int64,  // Renamed from 'newSize'
         contentType: String,
         userID: UUID,
         lastModified: Int64? = nil
@@ -197,31 +235,50 @@ struct StorageService: Sendable {
 
         guard !existingFile.isDirectory else {
             throw Abort(.badRequest, reason: "Directories cannot be updated with file content.")
+                .localized("upload.error.unknown")
         }
 
-        let sizeDelta = newSize - existingFile.size
+        let estimatedDelta = claimedSize - existingFile.size
+        let maxAllowedSize = claimedSize + max(claimedSize / 20, 1024 * 1024)
 
-        // Adjust Quota (only if the file is larger)
-        // If smaller, we reclaim space after the successful write.
-        if sizeDelta > 0 {
-            try await reserveQuota(amount: sizeDelta, userID: userID)
+        // Adjust Quota (only if the file is estimated to be larger)
+        if estimatedDelta > 0 {
+            try await reserveQuota(amount: estimatedDelta, userID: userID)
         }
 
         // Physical Write (Overwrite)
+        let actualSize: Int64
         do {
-            // Use same provider save method to overwrite the file
-            // TODO: Maybe we should add a different method to the provider for overwriting "updating" files
-            try await provider.save(stream: stream, id: fileID, size: newSize, on: eventLoop)
+            actualSize = try await provider.save(
+                stream: stream,
+                id: fileID,
+                maxSize: maxAllowedSize,
+                on: eventLoop
+            )
         } catch {
             // Rollback quota if we reserved it and failed
-            if sizeDelta > 0 {
-                try? await decrementQuota(amount: sizeDelta, userID: userID)
+            if estimatedDelta > 0 {
+                try? await decrementQuota(amount: estimatedDelta, userID: userID)
             }
             throw error
         }
 
-        // Update Metadata
-        existingFile.size = newSize
+        // Calculate actual delta
+        let actualDelta = actualSize - existingFile.size
+
+        // Adjust quota based on actual size difference
+        if actualDelta > estimatedDelta {
+            // Need more quota than we reserved
+            let additionalNeeded = actualDelta - estimatedDelta
+            try await reserveQuota(amount: additionalNeeded, userID: userID)
+        } else if actualDelta < estimatedDelta {
+            // Need less quota than we reserved, return the difference
+            let toReturn = estimatedDelta - actualDelta
+            try? await decrementQuota(amount: toReturn, userID: userID)
+        }
+
+        // Update Metadata with actual size
+        existingFile.size = actualSize
         existingFile.contentType = contentType
         existingFile.updatedAt = Date()
         if let lastModified = lastModified {
@@ -231,23 +288,15 @@ struct StorageService: Sendable {
 
         do {
             try await existingFile.save(on: db)
-
-            // Reclaim the space now if the file is smaller
-            if sizeDelta < 0 {
-                try await decrementQuota(amount: abs(sizeDelta), userID: userID)
-            }
-
             try await recordSyncChange(
                 fileID: fileID, userID: userID, type: .upsert, contentUpdated: true, on: db)
             return existingFile
         } catch {
-            // This is a rare edge case: Physical file updated but DB failed.
-            // We leave the quota as is to prevent under-counting, but log the desync.
-            logger.critical("Metadata update failed for file \(fileID) after physical write.")
+            // Rollback changes on metadata save failure
+            try? await decrementQuota(amount: actualDelta, userID: userID)
             throw error
         }
     }
-
     func rename(fileID: UUID, newName: String, userID: UUID) async throws -> FileMetadata {
         // Fetch the file and validate ownership
         let file = try await validateOwnership(fileID: fileID, userID: userID)
@@ -279,6 +328,7 @@ struct StorageService: Sendable {
             let parent = try await validateOwnership(fileID: pID, userID: userID)
             guard parent.isDirectory else {
                 throw Abort(.badRequest, reason: "Cannot move file into a non-directory item.")
+                    .localized("files.alerts.moveFailed")
             }
         }
 
@@ -303,7 +353,7 @@ struct StorageService: Sendable {
             .first()
 
         guard let file = file else {
-            throw Abort(.notFound)
+            throw Abort(.notFound).localized("files.alerts.restoreFailed")
         }
 
         // Check if the parent folder exists (and is active/not in trash)
@@ -407,7 +457,7 @@ struct StorageService: Sendable {
     // Hard delete "Permanent delete"
     func deleteRecursive(fileID: UUID, userID: UUID) async throws {
         let allItems = try await fetchAllDescendants(of: fileID, userID: userID)
-        guard !allItems.isEmpty else { throw Abort(.notFound) }
+        guard !allItems.isEmpty else { throw Abort(.notFound).localized("error.generic") }
 
         let totalSize = allItems.reduce(0) { $0 + $1.size }
 
@@ -442,14 +492,14 @@ struct StorageService: Sendable {
                 .filter(\.$owner.$id == userID)
                 .first()
         else {
-            throw Abort(.notFound)
+            throw Abort(.notFound).localized("error.generic")
         }
         return item
     }
 
     private func reserveQuota(amount: Int64, userID: UUID) async throws {
         guard let sql = db as? any SQLDatabase else {
-            throw Abort(.internalServerError)
+            throw Abort(.internalServerError).localized("error.generic")
         }
 
         // We use a subquery to check the limit against the current usage + the new file size.
@@ -470,7 +520,8 @@ struct StorageService: Sendable {
         ).first()
 
         if result == nil {
-            throw Abort(.payloadTooLarge, reason: "Quota exceeded or user not found.")
+            throw Abort(.payloadTooLarge, reason: "Quota exceeded or user not found.").localized(
+                "upload.error.quotaExceeded")
         }
     }
 
@@ -550,10 +601,225 @@ struct StorageService: Sendable {
             throw Abort(
                 .conflict,
                 reason: "A file or folder with the name '\(name)' already exists in this directory."
-            )
+            ).localized("upload.error.nameConflict")
         }
     }
 
+}
+// ADD THIS ENTIRE EXTENSION TO YOUR StorageService.swift FILE
+// Place it at the end of the file, before the FileFilter enum extension
+
+extension StorageService {
+
+    // MARK: - Multipart Upload Operations
+
+    /// Initiate a multipart upload session
+    func initiateMultipartUpload(
+        filename: String,
+        contentType: String,
+        totalSize: Int64,
+        parentID: UUID?,
+        lastModified: Int64?,
+        userID: UUID,
+        request: Request
+    ) async throws -> MultipartUploadSession {
+
+        if let parentID = parentID {
+            try await validateOwnership(fileID: parentID, userID: userID)
+        }
+        try await ensureUniqueName(name: filename, parentID: parentID, userID: userID)
+        try await reserveQuota(amount: totalSize, userID: userID)
+
+        // Generate file ID (but don't create FileMetadata yet)
+        let fileID = UUID()
+        let maxChunkSize = request.application.config.maxChunkSize
+        // Initiate upload with storage provider
+        let uploadID = try await provider.initiateMultipartUpload(id: fileID)
+
+        // Create upload session record - this stores everything during upload
+        let session = MultipartUploadSession()
+        session.id = UUID()
+        session.fileID = fileID
+        session.uploadID = uploadID
+        session.userID = userID
+        session.filename = filename
+        session.contentType = contentType
+        session.totalSize = totalSize
+        session.maxChunkSize = Int64(maxChunkSize.value)
+        session.parentID = parentID
+        session.lastModified = lastModified
+        session.totalParts = 0
+        session.completedParts = []
+
+        try await session.save(on: db)
+
+        logger.info(
+            "Multipart upload initiated",
+            metadata: [
+                "fileID": .string(fileID.uuidString),
+                "uploadID": .string(uploadID),
+                "filename": .string(filename),
+            ]
+        )
+
+        return session
+    }
+
+    /// Upload a single part
+    func uploadPart(
+        sessionID: UUID,
+        partNumber: Int,
+        stream: Request.Body,
+        size: Int64
+    ) async throws -> CompletedPart {
+        guard let session = try await MultipartUploadSession.find(sessionID, on: db) else {
+            throw Abort(.notFound, reason: "Upload session not found")
+        }
+
+        // Verify ownership
+        guard session.userID == session.userID else {
+            throw Abort(.forbidden)
+        }
+
+        let completedPart = try await provider.uploadPart(
+            id: session.fileID,
+            uploadID: session.uploadID,
+            partNumber: partNumber,
+            stream: stream,
+            maxSize: size,
+            on: eventLoop
+        )
+
+        // Update session with completed part
+        var parts = session.completedParts
+        parts.append(completedPart)
+        session.completedParts = parts
+        try await session.save(on: db)
+
+        logger.info(
+            "Part uploaded",
+            metadata: [
+                "sessionID": .string(sessionID.uuidString),
+                "partNumber": .string("\(partNumber)"),
+                "size": .string("\(size)"),
+            ]
+        )
+
+        return completedPart
+    }
+
+    /// Complete the multipart upload
+    func completeMultipartUpload(
+        sessionID: UUID,
+        userID: UUID
+    ) async throws -> FileMetadata {
+        guard let session = try await MultipartUploadSession.find(sessionID, on: db) else {
+            throw Abort(.notFound, reason: "Upload session not found")
+        }
+
+        // Verify ownership
+        guard session.userID == userID else {
+            throw Abort(.forbidden)
+        }
+
+        // Ensure parent directory exists (if specified)
+        if let parentID = session.parentID {
+            let parentDir = try await validateOwnership(fileID: parentID, userID: userID)
+            guard parentDir.isDirectory else {
+                throw Abort(.badRequest, reason: "Parent is not a directory")
+            }
+        }
+
+        // Complete the upload with the storage provider
+        try await provider.completeMultipartUpload(
+            id: session.fileID,
+            uploadID: session.uploadID,
+            parts: session.completedParts
+        )
+
+        // NOW create the FileMetadata (only after successful upload)
+        // Copy all metadata from session to FileMetadata
+        let metadata = FileMetadata(
+            id: session.fileID,
+            filename: session.filename,
+            contentType: session.contentType,
+            size: session.totalSize,
+            parentID: session.parentID,
+            ownerID: userID,
+            lastModified: session.lastModified.map {
+                Date(timeIntervalSince1970: TimeInterval($0) / 1000)
+            } ?? Date()
+        )
+
+        // Set lastModified if provided, otherwise use current time
+        if let lastModified = session.lastModified {
+            metadata.lastModified = Date(timeIntervalSince1970: TimeInterval(lastModified / 1000))
+        }
+
+        if let parentID = session.parentID {
+            metadata.parent = try await FileMetadata.find(parentID, on: db)
+        }
+
+        try await metadata.save(on: db)
+
+        // Clean up session
+        try await session.delete(on: db)
+
+        logger.info(
+            "Multipart upload completed",
+            metadata: [
+                "fileID": .string(session.fileID.uuidString),
+                "uploadID": .string(session.uploadID),
+            ]
+        )
+
+        return metadata
+    }
+
+    /// Abort a multipart upload
+    func abortMultipartUpload(
+        sessionID: UUID,
+        userID: UUID
+    ) async throws {
+        guard let session = try await MultipartUploadSession.find(sessionID, on: db) else {
+            throw Abort(.notFound, reason: "Upload session not found")
+        }
+
+        // Verify ownership
+        guard session.userID == userID else {
+            throw Abort(.forbidden)
+        }
+
+        // Abort with storage provider (cleans up chunks)
+        try await provider.abortMultipartUpload(
+            id: session.fileID,
+            uploadID: session.uploadID
+        )
+
+        // Delete session (no FileMetadata to clean up since it was never created)
+        try await session.delete(on: db)
+
+        logger.info(
+            "Multipart upload aborted",
+            metadata: [
+                "sessionID": .string(sessionID.uuidString),
+                "uploadID": .string(session.uploadID),
+            ]
+        )
+    }
+
+    /// Get upload session status
+    func getUploadSession(sessionID: UUID, userID: UUID) async throws -> MultipartUploadSession {
+        guard let session = try await MultipartUploadSession.find(sessionID, on: db) else {
+            throw Abort(.notFound, reason: "Upload session not found")
+        }
+
+        guard session.userID == userID else {
+            throw Abort(.forbidden)
+        }
+
+        return session
+    }
 }
 
 // MARK: - Filter Enum
