@@ -2,7 +2,6 @@ import Fluent
 import FluentPostgresDriver
 import FluentSQLiteDriver
 import JWT
-import Leaf
 import NIOSSL
 import SotoCore
 import Vapor
