@@ -2,6 +2,8 @@ import Fluent
 import JWT
 import Vapor
 
+// MARK: - User Payload Authenticator
+
 struct UserPayloadAuthenticator: AsyncRequestAuthenticator {
     func authenticate(request: Request) async throws {
         // 1. Extract token from Bearer header, Cookie, or Query param

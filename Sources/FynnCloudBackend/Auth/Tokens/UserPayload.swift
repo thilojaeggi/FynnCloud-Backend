@@ -1,6 +1,8 @@
 import JWT
 import Vapor
 
+// MARK: - User JWT Payload
+
 struct UserPayload: JWTPayload, Authenticatable {
     // Maps the longer Swift property names to the
     // shortened keys used in the JWT payload.
@@ -23,11 +25,6 @@ struct UserPayload: JWTPayload, Authenticatable {
 
     var jti: IDClaim
 
-    // Run any additional verification logic beyond
-    // signature verification here.
-    // Since we have an ExpirationClaim, we will
-    // call its verify method.
-
     func getID() throws -> UUID {
         guard let uuid = UUID(uuidString: subject.value) else {
             throw Abort(.badRequest, reason: "Invalid subject claim").localized(
@@ -39,5 +36,4 @@ struct UserPayload: JWTPayload, Authenticatable {
     func verify(using algorithm: some JWTAlgorithm) async throws {
         try self.expiration.verifyNotExpired()
     }
-
 }
