@@ -19,11 +19,12 @@ struct FileController: RouteCollection {
         protected.on(.PUT, body: .stream, use: upload)
         protected.on(.PUT, ":fileID", body: .stream, use: update)
         protected.post("multipart", "initiate", use: initiateMultipartUpload)
-        protected.on(
+        let jwtProtected = api.grouped(
+            UploadSessionAuthenticator(), UploadSessionToken.guardMiddleware())
+        jwtProtected.on(
             .PUT, "multipart", ":sessionID", "part", ":partNumber", body: .stream, use: uploadPart)
-        protected.post("multipart", ":sessionID", "complete", use: completeMultipartUpload)
-        protected.delete("multipart", ":sessionID", "abort", use: abortMultipartUpload)
-        protected.get("multipart", ":sessionID", "status", use: getUploadStatus)
+        jwtProtected.post("multipart", ":sessionID", "complete", use: completeMultipartUpload)
+        jwtProtected.delete("multipart", ":sessionID", "abort", use: abortMultipartUpload)
 
         // Directory operations
         protected.post("create-directory", use: createDirectory)
@@ -70,6 +71,7 @@ struct FileController: RouteCollection {
         let userID = try req.auth.require(UserPayload.self).getID()
         return try await req.storage.list(filter: .trash, userID: userID)
     }
+
     func recent(req: Request) async throws -> FileIndexDTO {
         let userID = try req.auth.require(UserPayload.self).getID()
         return try await req.storage.list(filter: .recent, userID: userID)
@@ -266,8 +268,6 @@ struct FileController: RouteCollection {
             throw Abort(.notFound).localized("error.generic")
         }
 
-        // Check for specific value in body if we want to set true/false explicitly
-
         if let input = try? req.content.decode(ToggleFavoriteInput.self), let val = input.isFavorite
         {
             file.isFavorite = val
@@ -305,27 +305,52 @@ struct FileController: RouteCollection {
             request: req
         )
 
+        // Generate JWT token with ALL metadata for stateless uploads
+        let token = UploadSessionToken(
+            exp: .init(value: Date().addingTimeInterval(86400)),  // 24 hours
+            iat: .init(value: Date()),
+            sessionID: session.sessionID,
+            fileID: session.fileID,
+            uploadID: session.uploadID,
+            userID: userID,
+            filename: session.filename,
+            contentType: session.contentType,
+            totalSize: session.totalSize,
+            maxChunkSize: session.maxChunkSize,
+            parentID: session.parentID,
+            lastModified: session.lastModified
+        )
+
+        let jwtToken = try await req.jwt.sign(token)
+
         req.logger.info(
             "Multipart upload initiated",
             metadata: [
-                "sessionID": .string(session.id?.uuidString ?? ""),
+                "sessionID": .string(session.sessionID.uuidString),
                 "filename": .string(input.filename),
-                "size": .string("\(input.totalSize)"),
             ]
         )
 
         return InitiateMultipartResponse(
-            sessionID: session.id!,
+            sessionID: session.sessionID,
             fileID: session.fileID,
             uploadID: session.uploadID,
-            maxChunkSize: session.maxChunkSize
+            maxChunkSize: session.maxChunkSize,
+            token: jwtToken
         )
     }
 
     func uploadPart(req: Request) async throws -> UploadPartResponse {
-        let userID = try req.auth.require(UserPayload.self).getID()
+        // Authenticate using JWT from Authorization header
+        let token = try req.auth.require(UploadSessionToken.self)
+
+        // Validate route parameters match JWT claims
         let sessionID = try req.parameters.require("sessionID", as: UUID.self)
         let partNumber = try req.parameters.require("partNumber", as: Int.self)
+
+        guard sessionID == token.sessionID else {
+            throw Abort(.forbidden, reason: "Session ID mismatch")
+        }
 
         guard let contentLength = req.headers.first(name: .contentLength).flatMap(Int64.init),
             contentLength > 0
@@ -333,35 +358,73 @@ struct FileController: RouteCollection {
             throw Abort(.lengthRequired, reason: "Content-Length header required")
         }
 
-        let completedPart = try await req.storage.uploadPart(
-            sessionID: sessionID,
+        // Validate part size doesn't exceed max chunk size
+        guard contentLength <= token.maxChunkSize else {
+            throw Abort(.badRequest, reason: "Chunk size exceeds maximum allowed")
+        }
+
+        // STATELESS - streams to provider, NO DB operations
+        let completedPart = try await req.storage.uploadPartWithToken(
+            fileID: token.fileID,
+            uploadID: token.uploadID,
             partNumber: partNumber,
             stream: req.body,
             size: contentLength
         )
 
-        req.logger.info(
+        req.logger.debug(
             "Part uploaded",
             metadata: [
                 "sessionID": .string(sessionID.uuidString),
                 "partNumber": .string("\(partNumber)"),
-                "size": .string("\(contentLength)"),
+                "etag": .string(completedPart.etag),
             ]
         )
 
         return UploadPartResponse(
             partNumber: completedPart.partNumber,
-            etag: completedPart.etag
+            etag: completedPart.etag,
+            size: completedPart.size
         )
     }
 
+    struct CompleteMultipartInput: Content {
+        let parts: [CompletedPartDTO]
+    }
+
+    struct CompletedPartDTO: Content {
+        let partNumber: Int
+        let etag: String
+        let size: Int64
+    }
+
     func completeMultipartUpload(req: Request) async throws -> FileMetadata {
-        let userID = try req.auth.require(UserPayload.self).getID()
+        let token = try req.auth.require(UploadSessionToken.self)
         let sessionID = try req.parameters.require("sessionID", as: UUID.self)
 
-        let metadata = try await req.storage.completeMultipartUpload(
-            sessionID: sessionID,
-            userID: userID
+        guard sessionID == token.sessionID else {
+            throw Abort(.forbidden, reason: "Session ID mismatch")
+        }
+
+        // Parse parts from request body (client tracked these during upload)
+        let input = try req.content.decode(CompleteMultipartInput.self)
+
+        let parts = input.parts.map { dto in
+            CompletedPart(partNumber: dto.partNumber, etag: dto.etag, size: dto.size)
+        }
+
+        // Complete using JWT metadata - stateless!
+        let metadata = try await req.storage.completeMultipartUploadWithToken(
+            sessionID: token.sessionID,
+            fileID: token.fileID,
+            uploadID: token.uploadID,
+            userID: token.userID,
+            filename: token.filename,
+            contentType: token.contentType,
+            totalSize: token.totalSize,
+            parentID: token.parentID,
+            lastModified: token.lastModified,
+            parts: parts
         )
 
         req.logger.info(
@@ -376,70 +439,25 @@ struct FileController: RouteCollection {
     }
 
     func abortMultipartUpload(req: Request) async throws -> HTTPStatus {
-        let userID = try req.auth.require(UserPayload.self).getID()
-        let sessionID = try req.parameters.require("sessionID", as: UUID.self)
+        // Use JWT authentication to get all metadata
+        let token = try req.auth.require(UploadSessionToken.self)
 
         try await req.storage.abortMultipartUpload(
-            sessionID: sessionID,
-            userID: userID
+            fileID: token.fileID,
+            uploadID: token.uploadID,
+            sessionID: token.sessionID,
+            totalSize: token.totalSize,
+            userID: token.userID
         )
 
         req.logger.info(
             "Multipart upload aborted",
             metadata: [
-                "sessionID": .string(sessionID.uuidString)
+                "sessionID": .string(token.sessionID.uuidString),
+                "fileID": .string(token.fileID.uuidString),
             ]
         )
 
         return .noContent
     }
-
-    func getUploadStatus(req: Request) async throws -> UploadStatusResponse {
-        let userID = try req.auth.require(UserPayload.self).getID()
-        let sessionID = try req.parameters.require("sessionID", as: UUID.self)
-
-        let session = try await req.storage.getUploadSession(
-            sessionID: sessionID,
-            userID: userID
-        )
-
-        return UploadStatusResponse(
-            sessionID: session.id!,
-            fileID: session.fileID,
-            uploadID: session.uploadID,
-            completedParts: session.completedParts.count,
-            totalParts: session.totalParts
-        )
-    }
-}
-
-// MARK: - DTOs
-
-struct InitiateMultipartInput: Content {
-    let filename: String
-    let contentType: String
-    let totalSize: Int64
-    let parentID: UUID?
-    let lastModified: Int64?  // Unix timestamp in milliseconds
-    let chunkSize: Int64?  // Optional, client can specify preferred chunk size
-}
-
-struct InitiateMultipartResponse: Content {
-    let sessionID: UUID
-    let fileID: UUID
-    let uploadID: String
-    let maxChunkSize: Int64
-}
-
-struct UploadPartResponse: Content {
-    let partNumber: Int
-    let etag: String
-}
-
-struct UploadStatusResponse: Content {
-    let sessionID: UUID
-    let fileID: UUID
-    let uploadID: String
-    let completedParts: Int
-    let totalParts: Int
 }
