@@ -74,13 +74,15 @@ struct AppConfig: Sendable {
             Environment.get("PRIMARY_COLOR")
             .flatMap(TailwindColor.init) ?? .blue
 
+        let frontendURL = Environment.get("FRONTEND_URL") ?? "https://localhost"
+
         return AppConfig(
             database: dbStrategy,
             storage: storage,
             maxBodySize: maxBodySize,
             maxChunkSize: maxChunkSize,
             jwtSecret: Environment.get("JWT_SECRET") ?? [UInt8].random(count: 32).base64,
-            corsAllowedOrigins: (Environment.get("CORS_ALLOWED_ORIGINS") ?? "https://localhost")
+            corsAllowedOrigins: (Environment.get("CORS_ALLOWED_ORIGINS") ?? frontendURL)
                 .split(separator: ",").map(String.init),
             aws: AWSConfig(
                 accessKey: Environment.get("AWS_ACCESS_KEY_ID") ?? "",
@@ -88,7 +90,7 @@ struct AppConfig: Sendable {
                 region: Environment.get("AWS_REGION") ?? "us-east-1",
                 endpoint: Environment.get("AWS_ENDPOINT") ?? "https://s3.amazonaws.com"
             ),
-            frontendURL: Environment.get("FRONTEND_URL") ?? "http://localhost",
+            frontendURL: frontendURL,
             primaryColor: color,
             appName: Environment.get("APP_NAME") ?? "FynnCloud",
             appVersion: "1.0.0"
