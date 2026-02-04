@@ -1,143 +1,65 @@
-name: Build And Push Docker image
+# ================================
+# Build image
+# ================================
+FROM swift:6.1-noble AS build
 
-on:
-  schedule:
-    - cron: "0 23 * * *"
-  push:
-    branches:
-      - "main"
-    tags:
-      - "v*.*.*"
-  pull_request:
-    branches:
-      - "main"
-  workflow_dispatch:
+# Install OS updates and dependencies in one layer
+RUN export DEBIAN_FRONTEND=noninteractive DEBCONF_NONINTERACTIVE_SEEN=true \
+    && apt-get -q update \
+    && apt-get -q dist-upgrade -y \
+    && apt-get install -y libjemalloc-dev \
+    && rm -rf /var/lib/apt/lists/*
 
-jobs:
-  build_and_push:
-    name: Docker Build (${{ matrix.platform }})
-    runs-on: ${{ matrix.runner }}
-    permissions:
-      contents: read
-      packages: write
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - platform: linux/amd64
-            runner: ubuntu-24.04
-          - platform: linux/arm64
-            runner: ubuntu-24.04-arm
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+WORKDIR /build
 
-      - name: Prepare platform tag
-        id: prep
-        run: |
-          platform=${{ matrix.platform }}
-          echo "platform-tag=${platform//\//-}" >> $GITHUB_OUTPUT
+# Copy dependency files first for better caching
+COPY ./Package.* ./
+RUN swift package resolve \
+        $([ -f ./Package.resolved ] && echo "--force-resolved-versions" || true)
 
-      - name: Extract Docker metadata
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ghcr.io/${{ github.repository }}
-          tags: |
-            type=raw,value=latest,enable={{is_default_branch}}
-            type=ref,event=branch
-            type=semver,pattern={{version}}
-            type=ref,event=pr
-          flavor: |
-            latest=false
+# Copy source code
+COPY . .
 
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
+# Build with build cache mount and parallel jobs
+RUN --mount=type=cache,target=/build/.build,sharing=locked \
+    swift build -c release \
+        --product FynnCloudBackend \
+        --static-swift-stdlib \
+        -Xlinker -ljemalloc \
+        -Xswiftc -j$(nproc) \
+    && mkdir -p /staging \
+    && cp ".build/release/FynnCloudBackend" /staging \
+    && find -L ".build/release" -regex '.*\.resources$' -exec cp -Ra {} /staging \; \
+    && cp "/usr/libexec/swift/linux/swift-backtrace-static" /staging \
+    && ([ -d /build/Public ] && cp -R /build/Public /staging/ || true) \
+    && ([ -d /build/Resources ] && cp -R /build/Resources /staging/ || true)
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+# ================================
+# Run image
+# ================================
+FROM ubuntu:noble
 
-      - name: Login to Container Registry
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+RUN export DEBIAN_FRONTEND=noninteractive DEBCONF_NONINTERACTIVE_SEEN=true \
+    && apt-get -q update \
+    && apt-get -q dist-upgrade -y \
+    && apt-get -q install -y \
+      libjemalloc2 \
+      ca-certificates \
+      tzdata \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --user-group --create-home --system --skel /dev/null --home-dir /app vapor
 
-      - name: Build and push Docker image
-        id: build
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          platforms: ${{ matrix.platform }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha,scope=buildkit-${{ steps.prep.outputs.platform-tag }}
-          cache-to: type=gha,mode=max,scope=buildkit-${{ steps.prep.outputs.platform-tag }}
-          outputs: type=image,name=ghcr.io/${{ github.repository }},push-by-digest=true,name-canonical=true,push=${{ github.event_name != 'pull_request' }}
-          provenance: false
+WORKDIR /app
 
-      - name: Export digest
-        if: github.event_name != 'pull_request'
-        run: |
-          mkdir -p /tmp/digests
-          digest="${{ steps.build.outputs.digest }}"
-          touch "/tmp/digests/${digest#sha256:}"
+COPY --from=build --chown=vapor:vapor /staging /app
 
-      - name: Upload digest
-        if: github.event_name != 'pull_request'
-        uses: actions/upload-artifact@v4
-        with:
-          name: digests-${{ steps.prep.outputs.platform-tag }}
-          path: /tmp/digests/*
-          if-no-files-found: error
-          retention-days: 1
+RUN chmod -R a-w ./Public ./Resources 2>/dev/null || true
 
-  merge:
-    name: Create multi-arch manifest
-    runs-on: ubuntu-24.04
-    if: github.event_name != 'pull_request'
-    needs: [build_and_push]
-    permissions:
-      contents: read
-      packages: write
-    steps:
-      - name: Download digests
-        uses: actions/download-artifact@v4
-        with:
-          pattern: digests-*
-          path: /tmp/digests
-          merge-multiple: true
+ENV SWIFT_BACKTRACE=enable=yes,sanitize=yes,threads=all,images=all,interactive=no,swift-backtrace=./swift-backtrace-static
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+USER vapor:vapor
 
-      - name: Login to Container Registry
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+EXPOSE 8080
 
-      - name: Extract Docker metadata
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ghcr.io/${{ github.repository }}
-          tags: |
-            type=raw,value=latest,enable={{is_default_branch}}
-            type=ref,event=branch
-            type=semver,pattern={{version}}
-            type=ref,event=pr
-          flavor: |
-            latest=false
-
-      - name: Create manifest list and push
-        working-directory: /tmp/digests
-        run: |
-          docker buildx imagetools create \
-            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
-            $(printf 'ghcr.io/${{ github.repository }}@sha256:%s ' *)
-
-      - name: Inspect image
-        run: |
-          docker buildx imagetools inspect ghcr.io/${{ github.repository }}:${{ steps.meta.outputs.version }}
+ENTRYPOINT ["./FynnCloudBackend"]
+CMD ["serve", "--env", "production", "--hostname", "0.0.0.0", "--port", "8080"]
