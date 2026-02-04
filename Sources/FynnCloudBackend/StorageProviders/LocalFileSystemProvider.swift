@@ -127,10 +127,12 @@ struct LocalFileSystemProvider: FileStorageProvider {
         let chunkPath = getChunkPath(for: id, uploadID: uploadID, partNumber: partNumber)
         let filePath = FilePath(chunkPath)
 
-        // Use ByteCountingBody for consistency with S3Provider
         let countingBody = ByteCountingBody(wrappedBody: stream, maxAllowedSize: maxSize)
 
-        // Write chunk to temporary file
+        // Initialize MD5 hasher for streaming hash calculation
+        var hasher = Insecure.MD5()
+
+        // Write chunk to temporary file while calculating hash
         try await FileSystem.shared.withFileHandle(
             forWritingAt: filePath,
             options: .newFile(replaceExisting: true)
@@ -138,14 +140,19 @@ struct LocalFileSystemProvider: FileStorageProvider {
             var offset: Int64 = 0
 
             for try await chunk in countingBody {
+                // Update hash with this chunk's data
+                chunk.withUnsafeReadableBytes { bufferPointer in
+                    hasher.update(bufferPointer: bufferPointer)
+                }
+
+                // Write chunk to disk
                 try await handle.write(contentsOf: chunk, toAbsoluteOffset: .init(offset))
                 offset += Int64(chunk.readableBytes)
             }
         }
 
-        // Calculate ETag (MD5 hash) of the chunk for verification
-        let data = try Data(contentsOf: URL(fileURLWithPath: chunkPath))
-        let hash = Insecure.MD5.hash(data: data)
+        // Finalize hash
+        let hash = hasher.finalize()
         let etag = hash.map { String(format: "%02x", $0) }.joined()
 
         return CompletedPart(
