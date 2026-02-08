@@ -20,6 +20,8 @@ struct StorageService: Sendable {
         contentUpdated: Bool = false,
         on transaction: any Database
     ) async throws {
+        // Disable globally for now as it's buggy
+        return
         let maxRetries = 3
         var lastError: (any Error)?
 
@@ -129,7 +131,7 @@ struct StorageService: Sendable {
             throw Abort(.badRequest, reason: "Cannot download a directory.").localized(
                 "error.generic")
         }
-        return try await provider.getResponse(for: id, on: eventLoop)
+        return try await provider.getResponse(for: id, userID: userID, on: eventLoop)
     }
 
     // MARK: - Actions
@@ -159,6 +161,7 @@ struct StorageService: Sendable {
             actualSize = try await provider.save(
                 stream: stream,
                 id: fileID,
+                userID: userID,
                 maxSize: maxAllowedSize,  // Enforce maximum
                 on: eventLoop
             )
@@ -176,7 +179,7 @@ struct StorageService: Sendable {
                 "Size mismatch: claimed \(claimedSize) bytes, actual \(actualSize) bytes"
             )
             // Clean up the file
-            try? await provider.delete(id: fileID)
+            try? await provider.delete(id: fileID, userID: userID)
             try? await decrementQuota(amount: claimedSize, userID: userID)
             throw Abort(
                 .badRequest,
@@ -216,7 +219,7 @@ struct StorageService: Sendable {
         } catch {
             // If metadata fails to save, we have a "Ghost File" on disk.
             // Clean up disk and quota.
-            try? await provider.delete(id: fileID)
+            try? await provider.delete(id: fileID, userID: userID)
             try? await decrementQuota(amount: actualSize, userID: userID)
             throw error
         }
@@ -252,6 +255,7 @@ struct StorageService: Sendable {
             actualSize = try await provider.save(
                 stream: stream,
                 id: fileID,
+                userID: userID,
                 maxSize: maxAllowedSize,
                 on: eventLoop
             )
@@ -463,7 +467,7 @@ struct StorageService: Sendable {
         let totalSize = allItems.reduce(0) { $0 + $1.size }
 
         for item in allItems where !item.isDirectory {
-            try await provider.delete(id: try item.requireID())
+            try await provider.delete(id: try item.requireID(), userID: userID)
         }
 
         try await db.transaction { transaction in
@@ -648,7 +652,7 @@ extension StorageService {
         let maxChunkSize = request.application.config.maxChunkSize
 
         // Initiate upload with storage provider
-        let uploadID = try await provider.initiateMultipartUpload(id: fileID)
+        let uploadID = try await provider.initiateMultipartUpload(id: fileID, userID: userID)
 
         // Create minimal session in database (for cleanup/audit only)
         let session = MultipartUploadSession(
@@ -693,6 +697,7 @@ extension StorageService {
         fileID: UUID,
         uploadID: String,
         partNumber: Int,
+        userID: UUID,
         stream: Request.Body,
         size: Int64
     ) async throws -> CompletedPart {
@@ -705,6 +710,7 @@ extension StorageService {
         // Upload the part to storage provider - NO DB operations!
         let completedPart = try await provider.uploadPart(
             id: fileID,
+            userID: userID,
             uploadID: uploadID,
             partNumber: partNumber,
             stream: stream,
@@ -770,6 +776,7 @@ extension StorageService {
         // Complete with provider (provider validates ETags)
         try await provider.completeMultipartUpload(
             id: fileID,
+            userID: userID,
             uploadID: uploadID,
             parts: sortedParts
         )
@@ -829,7 +836,8 @@ extension StorageService {
         // Abort with storage provider (cleans up chunks)
         try? await provider.abortMultipartUpload(
             id: fileID,
-            uploadID: uploadID
+            userID: userID,
+            uploadID: uploadID,
         )
 
         // Delete session record (cleanup)

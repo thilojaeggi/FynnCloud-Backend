@@ -8,28 +8,32 @@ struct LocalFileSystemProvider: FileStorageProvider {
     let storageDirectory: String
 
     // Directory for storing temporary chunks during multipart uploads
-    private var chunksDirectory: String {
-        storageDirectory + "_chunks/"
+    private func chunksDirectory(for userID: UUID) -> String {
+        storageDirectory + userID.uuidString + "/_chunks/"
     }
 
-    private func getInternalPath(for id: UUID) -> String {
+    private func getInternalPath(for id: UUID, userID: UUID) -> String {
         let uuidString = id.uuidString
         let prefix = String(uuidString.prefix(2))
-        return storageDirectory + prefix + "/" + uuidString
+        return storageDirectory + userID.uuidString + "/" + prefix + "/" + uuidString
     }
 
-    private func getChunkDirectory(for id: UUID, uploadID: String) -> String {
-        return chunksDirectory + id.uuidString + "/" + uploadID + "/"
+    private func getChunkDirectory(for id: UUID, userID: UUID, uploadID: String) -> String {
+        return chunksDirectory(for: userID) + id.uuidString + "/" + uploadID + "/"
     }
 
-    private func getChunkPath(for id: UUID, uploadID: String, partNumber: Int) -> String {
-        return getChunkDirectory(for: id, uploadID: uploadID) + "part_\(partNumber)"
+    private func getChunkPath(for id: UUID, userID: UUID, uploadID: String, partNumber: Int)
+        -> String
+    {
+        return getChunkDirectory(for: id, userID: userID, uploadID: uploadID) + "part_\(partNumber)"
     }
 
     // MARK: - Download
 
-    func getResponse(for id: UUID, on eventLoop: any EventLoop) async throws -> Response {
-        let path = getInternalPath(for: id)
+    func getResponse(for id: UUID, userID: UUID, on eventLoop: any EventLoop) async throws
+        -> Response
+    {
+        let path = getInternalPath(for: id, userID: userID)
 
         guard let info = try await FileSystem.shared.info(forFileAt: FilePath(path)) else {
             throw Abort(.notFound).localized("error.generic")
@@ -60,10 +64,11 @@ struct LocalFileSystemProvider: FileStorageProvider {
     func save(
         stream: Request.Body,
         id: UUID,
+        userID: UUID,
         maxSize: Int64,
         on eventLoop: any EventLoop
     ) async throws -> Int64 {
-        let path = getInternalPath(for: id)
+        let path = getInternalPath(for: id, userID: userID)
         let filePath = FilePath(path)
 
         try await FileSystem.shared.createDirectory(
@@ -88,26 +93,28 @@ struct LocalFileSystemProvider: FileStorageProvider {
         return countingBody.bytesReceived
     }
 
-    func delete(id: UUID) async throws {
-        try await FileSystem.shared.removeItem(at: FilePath(getInternalPath(for: id)))
-        if try await exists(id: id) {
+    func delete(id: UUID, userID: UUID) async throws {
+        try await FileSystem.shared.removeItem(
+            at: FilePath(getInternalPath(for: id, userID: userID)))
+        if try await exists(id: id, userID: userID) {
             throw Abort(.internalServerError).localized("error.generic")
         }
     }
 
-    func exists(id: UUID) async throws -> Bool {
-        let info = try await FileSystem.shared.info(forFileAt: FilePath(getInternalPath(for: id)))
+    func exists(id: UUID, userID: UUID) async throws -> Bool {
+        let info = try await FileSystem.shared.info(
+            forFileAt: FilePath(getInternalPath(for: id, userID: userID)))
         return info != nil
     }
 
     // MARK: - Multipart Upload (with size validation)
 
-    func initiateMultipartUpload(id: UUID) async throws -> String {
+    func initiateMultipartUpload(id: UUID, userID: UUID) async throws -> String {
         // Generate a unique upload ID
         let uploadID = UUID().uuidString
 
         // Create directory for this upload's chunks
-        let chunkDir = getChunkDirectory(for: id, uploadID: uploadID)
+        let chunkDir = getChunkDirectory(for: id, userID: userID, uploadID: uploadID)
         try await FileSystem.shared.createDirectory(
             at: FilePath(chunkDir),
             withIntermediateDirectories: true
@@ -118,13 +125,15 @@ struct LocalFileSystemProvider: FileStorageProvider {
 
     func uploadPart(
         id: UUID,
+        userID: UUID,
         uploadID: String,
         partNumber: Int,
         stream: Request.Body,
         maxSize: Int64,
         on eventLoop: any EventLoop
     ) async throws -> CompletedPart {
-        let chunkPath = getChunkPath(for: id, uploadID: uploadID, partNumber: partNumber)
+        let chunkPath = getChunkPath(
+            for: id, userID: userID, uploadID: uploadID, partNumber: partNumber)
         let filePath = FilePath(chunkPath)
 
         let countingBody = ByteCountingBody(wrappedBody: stream, maxAllowedSize: maxSize)
@@ -164,12 +173,13 @@ struct LocalFileSystemProvider: FileStorageProvider {
 
     func completeMultipartUpload(
         id: UUID,
+        userID: UUID,
         uploadID: String,
         parts: [CompletedPart]
     ) async throws {
-        let finalPath = getInternalPath(for: id)
+        let finalPath = getInternalPath(for: id, userID: userID)
         let finalFilePath = FilePath(finalPath)
-        let chunkDir = getChunkDirectory(for: id, uploadID: uploadID)
+        let chunkDir = getChunkDirectory(for: id, userID: userID, uploadID: uploadID)
 
         // Ensure final directory exists
         try await FileSystem.shared.createDirectory(
@@ -189,7 +199,7 @@ struct LocalFileSystemProvider: FileStorageProvider {
 
             for part in sortedParts {
                 let chunkPath = getChunkPath(
-                    for: id, uploadID: uploadID, partNumber: part.partNumber)
+                    for: id, userID: userID, uploadID: uploadID, partNumber: part.partNumber)
 
                 // Verify chunk exists
                 guard
@@ -214,12 +224,23 @@ struct LocalFileSystemProvider: FileStorageProvider {
         try await FileSystem.shared.removeItem(at: FilePath(chunkDir))
     }
 
-    func abortMultipartUpload(id: UUID, uploadID: String) async throws {
-        let chunkDir = getChunkDirectory(for: id, uploadID: uploadID)
+    func abortMultipartUpload(id: UUID, userID: UUID, uploadID: String) async throws {
+        let chunkDir = getChunkDirectory(for: id, userID: userID, uploadID: uploadID)
 
         // Remove the chunks directory if it exists
         if try await FileSystem.shared.info(forFileAt: FilePath(chunkDir)) != nil {
             try await FileSystem.shared.removeItem(at: FilePath(chunkDir))
         }
     }
+
+    // MARK: - User Operations
+
+    /// Delete all files for a specific user
+    func deleteUserData(userID: UUID) async throws {
+        let userDir = storageDirectory + userID.uuidString + "/"
+        if try await FileSystem.shared.info(forFileAt: FilePath(userDir)) != nil {
+            try await FileSystem.shared.removeItem(at: FilePath(userDir))
+        }
+    }
+
 }

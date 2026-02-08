@@ -368,6 +368,7 @@ struct FileController: RouteCollection {
             fileID: token.fileID,
             uploadID: token.uploadID,
             partNumber: partNumber,
+            userID: token.userID,
             stream: req.body,
             size: contentLength
         )

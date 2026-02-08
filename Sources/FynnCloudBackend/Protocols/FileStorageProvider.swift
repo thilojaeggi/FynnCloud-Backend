@@ -6,19 +6,22 @@ protocol FileStorageProvider: Sendable {
     func save(
         stream: Request.Body,
         id: UUID,
+        userID: UUID,
         maxSize: Int64,
         on eventLoop: any EventLoop
     ) async throws -> Int64  // Returns actual bytes written
 
-    func getResponse(for id: UUID, on eventLoop: any EventLoop) async throws -> Response
-    func delete(id: UUID) async throws
-    func exists(id: UUID) async throws -> Bool
+    func getResponse(for id: UUID, userID: UUID, on eventLoop: any EventLoop) async throws
+        -> Response
+    func delete(id: UUID, userID: UUID) async throws
+    func exists(id: UUID, userID: UUID) async throws -> Bool
 
     // Updated multipart upload methods - now return actual bytes written
-    func initiateMultipartUpload(id: UUID) async throws -> String
+    func initiateMultipartUpload(id: UUID, userID: UUID) async throws -> String
 
     func uploadPart(
         id: UUID,
+        userID: UUID,
         uploadID: String,
         partNumber: Int,
         stream: Request.Body,
@@ -28,11 +31,12 @@ protocol FileStorageProvider: Sendable {
 
     func completeMultipartUpload(
         id: UUID,
+        userID: UUID,
         uploadID: String,
         parts: [CompletedPart]
     ) async throws
 
-    func abortMultipartUpload(id: UUID, uploadID: String) async throws
+    func abortMultipartUpload(id: UUID, userID: UUID, uploadID: String) async throws
 }
 
 // Represents a successfully uploaded part
