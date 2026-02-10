@@ -2,30 +2,18 @@ import Fluent
 import FluentPostgresDriver
 import FluentSQLiteDriver
 import JWT
-import NIOSSL
 import SotoCore
+import SotoS3
 import Vapor
 
 public func configure(_ app: Application) async throws {
-    // Load Global Configuration
     let config = AppConfig.load(for: app)
     app.config = config
 
-    // CORS Configuration
-    let corsConfiguration = CORSMiddleware.Configuration(
-        allowedOrigin: app.environment == .production
-            ? .any(config.corsAllowedOrigins)
-            : .all,
-        allowedMethods: [.GET, .POST, .PUT, .OPTIONS, .DELETE, .PATCH],
-        allowedHeaders: [
-            .accept, .authorization, .contentType, .origin, .xRequestedWith, .userAgent,
-            .accessControlAllowOrigin,
-        ],
-        allowCredentials: false
-    )
-    app.middleware.use(CORSMiddleware(configuration: corsConfiguration), at: .beginning)
+    app.routes.defaultMaxBodySize = config.maxBodySize
+    configureCORS(app, config: config)
+    configureErrorMiddleware(app)
 
-    // Database Selection (Postgres vs SQLite)
     switch config.database {
     case .postgres(let pgConfig):
         app.databases.use(.postgres(configuration: pgConfig), as: .psql)
@@ -33,7 +21,6 @@ public func configure(_ app: Application) async throws {
         app.databases.use(.sqlite(.file(filename)), as: .sqlite)
     }
 
-    // Storage Driver Selection (Local vs S3)
     switch config.storage {
     case .s3(let bucket):
         app.logger.info("Using S3 storage with bucket: \(bucket)")
@@ -48,16 +35,63 @@ public func configure(_ app: Application) async throws {
         )
         app.services.awsClient.use { _ in awsClient }
         app.lifecycle.use(AWSLifecycleHandler())
-        app.storageConfig = .init(driver: .s3(bucket: bucket))
+        app.fileStorage = S3StorageProvider(
+            s3: S3(
+                client: awsClient, region: .init(awsRegionName: config.aws.region),
+                endpoint: config.aws.endpoint), bucket: bucket)
+
     case .local(let path):
         app.logger.info("Using local storage with path: \(path)")
-        app.storageConfig = .init(driver: .local(path: path))
+        app.fileStorage = LocalFileSystemProvider(storageDirectory: path)
     }
 
-    // Limits
-    app.routes.defaultMaxBodySize = config.maxBodySize
+    if config.ldapEnabled {
+        let ldapService = LDAPService(configuration: config.ldapConfig)
+        app.services.ldap.use { _ in ldapService }
+        app.lifecycle.use(LDAPLifecycleHandler())
+        app.logger.info("Connecting to LDAP...")
+        do {
+            try await ldapService.connect()
+            app.logger.info("✅ LDAP Connected Successfully")
+        } catch {
+            app.logger.error("❌ Failed to connect to LDAP: \(error)")
+        }
+    } else {
+        app.logger.info("LDAP is disabled")
+    }
 
-    // Error Middleware
+    await app.jwt.keys.add(hmac: HMACKey(from: config.jwtSecret), digestAlgorithm: .sha256)
+
+    app.migrations.add(CreateInitialMigration())
+    app.migrations.add(CreateSyncLog())
+    app.migrations.add(CreateOAuthCode())
+    app.migrations.add(AddClientIdAndStateToOAuthCode())
+    app.migrations.add(CreateOAuthGrant())
+    app.migrations.add(UpdateGrantForRotation())
+    app.migrations.add(CreateMultipartUploadSessions())
+
+    try await app.autoMigrate()
+    try routes(app)
+}
+
+// MARK: - Middleware
+
+private func configureCORS(_ app: Application, config: AppConfig) {
+    let corsConfiguration = CORSMiddleware.Configuration(
+        allowedOrigin: app.environment == .production
+            ? .any(config.corsAllowedOrigins)
+            : .all,
+        allowedMethods: [.GET, .POST, .PUT, .OPTIONS, .DELETE, .PATCH],
+        allowedHeaders: [
+            .accept, .authorization, .contentType, .origin, .xRequestedWith, .userAgent,
+            .accessControlAllowOrigin,
+        ],
+        allowCredentials: false
+    )
+    app.middleware.use(CORSMiddleware(configuration: corsConfiguration), at: .beginning)
+}
+
+private func configureErrorMiddleware(_ app: Application) {
     app.middleware.use(
         ErrorMiddleware { req, error in
             let status: HTTPResponseStatus
@@ -91,20 +125,4 @@ public func configure(_ app: Application) async throws {
             try? response.content.encode(body)
             return response
         })
-
-    // JWT Configuration
-    await app.jwt.keys.add(hmac: HMACKey(from: config.jwtSecret), digestAlgorithm: .sha256)
-
-    // Migrations
-    app.migrations.add(CreateInitialMigration())
-    app.migrations.add(CreateSyncLog())
-    app.migrations.add(CreateOAuthCode())
-    app.migrations.add(AddClientIdAndStateToOAuthCode())
-    app.migrations.add(CreateOAuthGrant())
-    app.migrations.add(UpdateGrantForRotation())
-    app.migrations.add(CreateMultipartUploadSessions())
-
-    // Auto Migrate & register Routes
-    try await app.autoMigrate()
-    try routes(app)
 }

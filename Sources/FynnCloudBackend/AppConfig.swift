@@ -1,10 +1,7 @@
-import Fluent
 import FluentPostgresDriver
-import FluentSQLiteDriver
 import Vapor
 
 struct AppConfig: Sendable {
-    // MARK: - Sub-Types
     enum DatabaseStrategy: Sendable {
         case postgres(SQLPostgresConfiguration)
         case sqlite(String)
@@ -21,9 +18,17 @@ struct AppConfig: Sendable {
             indigo, violet, purple, fuchsia, pink, rose
     }
 
-    // MARK: - Properties
+    struct AWSConfig: Sendable {
+        let accessKey: String
+        let secretKey: String
+        let region: String
+        let endpoint: String
+    }
+
     let database: DatabaseStrategy
     let storage: StorageDriver
+    let ldapEnabled: Bool
+    let ldapConfig: LDAPConfiguration
     let maxBodySize: ByteCount
     let maxChunkSize: ByteCount
     let jwtSecret: String
@@ -34,51 +39,44 @@ struct AppConfig: Sendable {
     let appName: String
     let appVersion: String
 
-    struct AWSConfig: Sendable {
-        let accessKey: String
-        let secretKey: String
-        let region: String
-        let endpoint: String
-    }
-
-    // MARK: - Loader
     static func load(for app: Application) -> AppConfig {
-        // Parse Sizes
         let maxChunkSizeStr = Environment.get("MAX_CHUNK_SIZE") ?? "100mb"
         let maxChunkSize = ByteCount(stringLiteral: maxChunkSizeStr)
         let maxBodySize = ByteCount(
             stringLiteral: Environment.get("MAX_BODY_SIZE") ?? maxChunkSizeStr)
 
-        // Database Strategy Logic
-        let dbStrategy: DatabaseStrategy = {
-            if let url = Environment.get("DATABASE_URL").flatMap(URL.init),
-                let pgConfig = try? SQLPostgresConfiguration(url: url)
-            {
-                return .postgres(pgConfig)
-            }
-            return .sqlite("db.sqlite")
-        }()
+        let frontendURL = Environment.get("FRONTEND_URL") ?? "https://localhost"
 
-        // Storage Logic
-        let storage: StorageDriver = {
-            if let bucket = Environment.get("S3_BUCKET") {
-                return .s3(bucket: bucket)
-            }
+        let dbStrategy: DatabaseStrategy
+        if let url = Environment.get("DATABASE_URL").flatMap(URL.init),
+            let pgConfig = try? SQLPostgresConfiguration(url: url)
+        {
+            dbStrategy = .postgres(pgConfig)
+        } else {
+            dbStrategy = .sqlite("db.sqlite")
+        }
+
+        let storage: StorageDriver
+        if let bucket = Environment.get("S3_BUCKET") {
+            storage = .s3(bucket: bucket)
+        } else {
             let path =
                 Environment.get("STORAGE_PATH") ?? "\(app.directory.workingDirectory)Storage/"
-            return .local(path: path)
-        }()
-
-        // Identity & UI
-        let color =
-            Environment.get("PRIMARY_COLOR")
-            .flatMap(TailwindColor.init) ?? .blue
-
-        let frontendURL = Environment.get("FRONTEND_URL") ?? "https://localhost"
+            storage = .local(path: path)
+        }
 
         return AppConfig(
             database: dbStrategy,
             storage: storage,
+            ldapEnabled: Bool(Environment.get("LDAP_ENABLED") ?? "false") ?? false,
+            ldapConfig: LDAPConfiguration(
+                host: Environment.get("LDAP_HOST") ?? "localhost",
+                port: Environment.get("LDAP_PORT").flatMap(UInt16.init),
+                useSSL: Environment.get("LDAP_USE_SSL") == "true",
+                baseDN: Environment.get("LDAP_BASE_DN") ?? "dc=my-company,dc=com",
+                bindDN: Environment.get("LDAP_BIND_DN") ?? "cn=admin,dc=my-company,dc=com",
+                password: Environment.get("LDAP_PASSWORD") ?? "JonSn0w"
+            ),
             maxBodySize: maxBodySize,
             maxChunkSize: maxChunkSize,
             jwtSecret: Environment.get("JWT_SECRET") ?? [UInt8].random(count: 32).base64,
@@ -91,15 +89,17 @@ struct AppConfig: Sendable {
                 endpoint: Environment.get("AWS_ENDPOINT") ?? "https://s3.amazonaws.com"
             ),
             frontendURL: frontendURL,
-            primaryColor: color,
+            primaryColor: Environment.get("PRIMARY_COLOR")
+                .flatMap(TailwindColor.init) ?? .blue,
             appName: Environment.get("APP_NAME") ?? "FynnCloud",
             appVersion: "1.0.0"
         )
     }
 }
-// Vapor Storage Extension
+
 extension Application {
-    struct ConfigKey: StorageKey { typealias Value = AppConfig }
+    private struct ConfigKey: StorageKey { typealias Value = AppConfig }
+
     var config: AppConfig {
         get { storage[ConfigKey.self] ?? .load(for: self) }
         set { storage[ConfigKey.self] = newValue }
