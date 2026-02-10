@@ -102,15 +102,14 @@ struct MetaController: RouteCollection {
                 ))
         }
 
-        // If http not https
-        if req.headers.first(name: "x-forwarded-proto") != "https" {
+        // If http not https, try to get from proxy first then fallback to url
+        if req.headers.first(name: "x-forwarded-proto") ?? req.url.scheme != "https" {
             alerts.append(
                 ServerAlert(
                     key: "httpNotHttps",
                     severity: .warning,
                     message:
-                        req.headers.first(name: "x-forwarded-proto") ?? req.url.scheme?.description
-                        ?? "unknown"
+                        "HTTP is being used in a production environment. Consider switching to HTTPS."
                 ))
         }
 
