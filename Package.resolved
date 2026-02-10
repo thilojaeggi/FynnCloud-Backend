@@ -1,5 +1,5 @@
 {
-  "originHash" : "9c479c26175f687bdd109abae78d7486a4515372a3d45517f64bf97918be20d1",
+  "originHash" : "3f37c94fa58a77b1f5707ffdff4b2fddd4ca00ada6cd0e81a0bbc6c48acc8012",
   "pins" : [
     {
       "identity" : "async-http-client",
@@ -359,6 +359,15 @@
       "state" : {
         "revision" : "395a77f0aa927f0ff73941d7ac35f2b46d47c9db",
         "version" : "1.6.3"
+      }
+    },
+    {
+      "identity" : "swiftdirector",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/sersoft-gmbh/SwiftDirector",
+      "state" : {
+        "revision" : "40f31e3c4ece180f2050fc08dd9f678e64c34724",
+        "version" : "0.0.17"
       }
     },
     {
