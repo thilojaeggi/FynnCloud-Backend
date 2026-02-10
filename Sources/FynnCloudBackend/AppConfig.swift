@@ -96,7 +96,7 @@ struct AppConfig: Sendable {
             primaryColor: Environment.get("PRIMARY_COLOR")
                 .flatMap(TailwindColor.init) ?? .blue,
             appName: Environment.get("APP_NAME") ?? "FynnCloud",
-            appVersion: "1.0.0",
+            appVersion: "0.0.1-dev",
             isJwtSecretDefault: isJwtSecretDefault
         )
     }
