@@ -109,7 +109,8 @@ struct MetaController: RouteCollection {
                     key: "httpNotHttps",
                     severity: .warning,
                     message:
-                        "HTTP is not recommended for production. Consider using HTTPS."
+                        req.headers.first(name: "x-forwarded-proto") ?? req.url.scheme?.description
+                        ?? "unknown"
                 ))
         }
 
