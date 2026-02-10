@@ -103,7 +103,7 @@ struct MetaController: RouteCollection {
         }
 
         // If http not https
-        if req.version != .http2 {
+        if req.headers.first(name: "x-forwarded-proto") != "https" {
             alerts.append(
                 ServerAlert(
                     key: "httpNotHttps",
