@@ -23,7 +23,10 @@ final class User: Model, Content, @unchecked Sendable {
     var files: [FileMetadata]
 
     @OptionalParent(key: "tier_id")
-    var tier: StorageTier?  
+    var tier: StorageTier?
+
+    @Siblings(through: UserGroup.self, from: \.$user, to: \.$group)
+    var groups: [Group]
 
     init() {}
 
@@ -39,11 +42,19 @@ final class User: Model, Content, @unchecked Sendable {
         self.$tier.id = tierID
     }
 
+    var isAdmin: Bool {
+        self.$groups.value?.contains(where: { $0.isAdmin }) ?? false
+    }
+
     struct Public: Content {
         var id: UUID
         var username: String
         var email: String
         var currentStorageUsage: Int64
+        var groups: [Group]
+        var tierID: Int?
+        var tierName: String?
+        var isAdmin: Bool
     }
 
     func toPublic() throws -> Public {
@@ -51,7 +62,11 @@ final class User: Model, Content, @unchecked Sendable {
             id: self.requireID(),
             username: self.username,
             email: self.email,
-            currentStorageUsage: self.currentStorageUsage
+            currentStorageUsage: self.currentStorageUsage,
+            groups: self.$groups.value ?? [],
+            tierID: self.$tier.id,
+            tierName: self.$tier.value??.name,
+            isAdmin: self.isAdmin
         )
     }
 }
