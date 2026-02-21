@@ -76,7 +76,9 @@ public func configure(_ app: Application) async throws {
     app.migrations.add(LowercaseUsernames())
     app.migrations.add(AddIndicesToFileMetadata())
 
-    try await app.autoMigrate()
+    if Environment.get("AUTO_MIGRATE") == "true" {
+        try await app.autoMigrate()
+    }
 
     app.settings = SettingsService(database: app.db)
 
